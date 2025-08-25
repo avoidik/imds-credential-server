@@ -47,8 +47,28 @@ type errorBody struct {
 	Error innerError
 }
 
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	log.Printf("Error %d: %s %s\n", status, code, message)
+var (
+	errorInvalidToken    = errors.New("the IMDSv2 token is invalid")
+	errorExpiredToken    = errors.New("the IMDSv2 token has expired")
+	errorInvalidTokenTtl = errors.New("the IMDSv2 token has invalid TTL")
+)
+
+func writeError(w http.ResponseWriter, status int, message string, err error, debug bool) {
+	writeErrorCode(w, status, http.StatusText(status), message, err, debug)
+}
+
+func writeErrorCode(w http.ResponseWriter, status int, code, message string, err error, debug bool) {
+	if debug {
+		if err != nil {
+			log.Printf("Error %d: %s, %s\n", status, message, err.Error())
+		} else {
+			log.Printf("Error %d: %s\n", status, message)
+		}
+	} else {
+		if status == http.StatusInternalServerError {
+			log.Println(err)
+		}
+	}
 
 	w.Header().Add("Content-type", "application/json")
 	w.WriteHeader(http.StatusMethodNotAllowed)
@@ -63,6 +83,25 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 		log.Fatal(err)
 	}
 	w.Write(bodyBytes)
+}
+
+func dumpHeaders(hdrs http.Header, method string, debug bool) {
+	if debug {
+		log.Printf("Request headers in %s:\n", method)
+		for name, values := range hdrs {
+			for _, value := range values {
+				log.Println("-", name, "=", value)
+			}
+		}
+	}
+}
+
+func dumpResponse(response, method string, debug bool) {
+	if debug {
+		log.Printf("Response from %s:\n", method)
+		log.Println(response)
+		log.Printf("Completed %s.\n", method)
+	}
 }
 
 type Config struct {
@@ -132,25 +171,25 @@ func (cfg *Config) EncodeToken(ttl time.Duration) []byte {
 func (cfg *Config) ValidateToken(token string) error {
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
-		return errors.New("The IMDSv2 token is invalid")
+		return errorInvalidToken
 	}
 	encodedExpirationStr := parts[0]
 	macStr := parts[1]
 
 	expirationBytes, err := base64.URLEncoding.DecodeString(encodedExpirationStr)
 	if err != nil {
-		return errors.New("The IMDSv2 token is invalid")
+		return errorInvalidToken
 	}
 
 	var expiration time.Time
 	err = expiration.UnmarshalText(expirationBytes)
 	if err != nil {
-		return errors.New("The IMDSv2 token is invalid")
+		return errorInvalidToken
 	}
 
 	macBytes, err := base64.URLEncoding.DecodeString(macStr)
 	if err != nil {
-		return errors.New("The IMDSv2 token is invalid")
+		return errorInvalidToken
 	}
 
 	mac := hmac.New(sha256.New, cfg.secret)
@@ -158,50 +197,43 @@ func (cfg *Config) ValidateToken(token string) error {
 
 	expectedMacBytes := mac.Sum(nil)
 	if !hmac.Equal(expectedMacBytes, macBytes) {
-		return errors.New("The IMDSv2 token is invalid")
+		return errorInvalidToken
 	}
 
 	now := time.Now().UTC()
 	if expiration.Before(now) {
-		return errors.New("The IMDSv2 token has expired")
+		return errorExpiredToken
 	}
 
 	return nil
 }
 
 func (cfg *Config) handleTokenRequest(w http.ResponseWriter, req *http.Request) {
-	if cfg.Debug {
-		log.Println("Request headers in handleTokenRequest:")
-		for name, values := range req.Header {
-			for _, value := range values {
-				log.Println("-", name, "=", value)
-			}
-		}
-	}
+	dumpHeaders(req.Header, "handleTokenRequest", cfg.Debug)
 
 	if req.Method != http.MethodPut {
-		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Token must be obtained with PUT")
+		writeError(w, http.StatusMethodNotAllowed, "Token must be obtained with PUT", nil, cfg.Debug)
 		return
 	}
 
 	forwardedFor := req.Header.Get("x-forwarded-for")
 	if forwardedFor != "" {
-		writeError(w, http.StatusUnauthorized, "InvalidHeader", "Token requests can't contain X-Forwarded-For")
+		writeErrorCode(w, http.StatusUnauthorized, "InvalidHeader", "Token requests can't contain X-Forwarded-For", nil, cfg.Debug)
 		return
 	}
 
 	ttlStr := req.Header.Get("x-aws-ec2-metadata-token-ttl-seconds")
 	if ttlStr == "" {
-		writeError(w, http.StatusUnauthorized, "MissingTTL", "The IMDSv2 token expiration header is missing")
+		writeErrorCode(w, http.StatusUnauthorized, "MissingTTL", "The IMDSv2 token expiration header is missing", nil, cfg.Debug)
 		return
 	}
 	ttlInt, err := strconv.Atoi(ttlStr)
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, "InvalidTTL", "The IMDSv2 token expiration is invalid")
+		writeErrorCode(w, http.StatusUnauthorized, "InvalidTTL", "The IMDSv2 token expiration is invalid", err, cfg.Debug)
 		return
 	}
 	if ttlInt <= 0 || ttlInt > 21600 {
-		writeError(w, http.StatusUnauthorized, "InvalidTTL", "The IMDSv2 token expiration is invalid")
+		writeErrorCode(w, http.StatusUnauthorized, "InvalidTTL", "The IMDSv2 token expiration is invalid", errorInvalidTokenTtl, cfg.Debug)
 		return
 	}
 	ttl := time.Second * time.Duration(ttlInt)
@@ -213,35 +245,24 @@ func (cfg *Config) handleTokenRequest(w http.ResponseWriter, req *http.Request) 
 	w.Header().Add("Content-type", "text/plain")
 	w.Write(bodyBytes)
 
-	if cfg.Debug {
-		log.Println("Response from handleTokenRequest:")
-		log.Println(string(bodyBytes))
-		log.Println("Completed handleTokenRequest")
-	}
+	dumpResponse(string(bodyBytes), "handleTokenRequest", cfg.Debug)
 }
 
 func (cfg *Config) handleRequest(w http.ResponseWriter, req *http.Request) {
-	if cfg.Debug {
-		log.Println("Request headers of handleRequest:")
-		for name, values := range req.Header {
-			for _, value := range values {
-				log.Println("-", name, "=", value)
-			}
-		}
-	}
+	dumpHeaders(req.Header, "handleRequest", cfg.Debug)
 
 	if req.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method not allowed")
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed", nil, cfg.Debug)
 		return
 	}
 
 	token := req.Header.Get("x-aws-ec2-metadata-token")
 	if token == "" {
-		writeError(w, http.StatusUnauthorized, "MissingToken", "The IMDSv2 token header is missing")
+		writeErrorCode(w, http.StatusUnauthorized, "MissingToken", "The IMDSv2 token header is missing", nil, cfg.Debug)
 		return
 	}
 	if err := cfg.ValidateToken(token); err != nil {
-		writeError(w, http.StatusUnauthorized, "InvalidToken", err.Error())
+		writeErrorCode(w, http.StatusUnauthorized, "InvalidToken", "Unable to validate token", err, cfg.Debug)
 		return
 	}
 
@@ -253,7 +274,7 @@ func (cfg *Config) handleRequest(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if cfg.Debug {
-		log.Println("Completed handleRequest")
+		log.Println("Completed handleRequest.")
 	}
 }
 
@@ -261,11 +282,7 @@ func (cfg *Config) handleRoleRequest(w http.ResponseWriter, req *http.Request) {
 	w.Header().Add("Content-type", "text/plain")
 	io.WriteString(w, cfg.PrincipalName)
 
-	if cfg.Debug {
-		log.Println("Response from handleRoleRequest:")
-		log.Println(cfg.PrincipalName)
-		log.Println("Completed handleRoleRequest")
-	}
+	dumpResponse(cfg.PrincipalName, "handleRoleRequest", cfg.Debug)
 }
 
 // This is based on the example output in the IMDS documentation:
@@ -364,24 +381,20 @@ func (cfg *Config) GenerateResponse() (Response, error) {
 func (cfg *Config) handleCredentialRequest(w http.ResponseWriter, req *http.Request, role string) {
 	response, err := cfg.GenerateResponse()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "InternalServerError", "Something went wrong")
+		writeError(w, http.StatusInternalServerError, "Something went wrong", err, cfg.Debug)
 		return
 	}
 
 	bodyBytes, err := json.Marshal(response)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "InternalServerError", "Something went wrong")
+		writeError(w, http.StatusInternalServerError, "Something went wrong", err, cfg.Debug)
 		return
 	}
 
 	w.Header().Add("Content-type", "application/json")
 	w.Write(bodyBytes)
 
-	if cfg.Debug {
-		log.Println("Response from handleCredentialRequest:")
-		log.Println(string(bodyBytes))
-		log.Println("Completed handleCredentialRequest")
-	}
+	dumpResponse(string(bodyBytes), "handleCredentialRequest", cfg.Debug)
 }
 
 /*
@@ -396,7 +409,7 @@ func (cfg *Config) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	} else if strings.HasPrefix(req.URL.Path, "/latest/meta-data/iam/security-credentials/") {
 		cfg.handleRequest(w, req)
 	} else {
-		writeError(w, http.StatusNotFound, "InvalidPath", "Invalid path")
+		writeErrorCode(w, http.StatusNotFound, "InvalidPath", "Invalid path", nil, cfg.Debug)
 	}
 }
 
